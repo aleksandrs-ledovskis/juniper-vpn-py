@@ -26,6 +26,10 @@ import pyasn1_modules.rfc2459
 import pyasn1.codec.der.decoder
 import xml.etree.ElementTree
 
+
+# import time, sched for period host checking
+import sched, time
+
 ssl._create_default_https_context = ssl._create_unverified_context
 
 debug = False
@@ -75,7 +79,7 @@ def decode_0ce4(buf, indent):
 
 # 0ce5 - string without hex prefixer
 def decode_0ce5(buf, indent):
-    s = struct.unpack(str(len(buf)) + "s", buf)
+    s = struct.unpack(str(len(buf)) + "s", buf)[0]
     logging.debug('%scmd 0ce5 (string) %d bytes', indent, len(buf))
     s = s.rstrip('\0')
     logging.debug('%s', s)
@@ -104,7 +108,7 @@ def decode_0cf0(buf, indent):
 
 # 0cf1 - string without hex prefixer
 def decode_0cf1(buf, indent):
-    s = struct.unpack(str(len(buf)) + "s", buf)
+    s = struct.unpack(str(len(buf)) + "s", buf)[0]
     logging.debug('%scmd 0cf1 (string) %d bytes', indent, len(buf))
     s = s.rstrip('\0')
     logging.debug('%s', s)
@@ -112,8 +116,9 @@ def decode_0cf1(buf, indent):
 
 # 0cf3 - u32
 def decode_0cf3(buf, indent):
-    logging.debug('%scmd 0cf3 (u32) %d bytes', indent, len(buf))
-    return struct.unpack(">I", buf)
+    ret = struct.unpack(">I", buf)
+    logging.debug('%scmd 0cf3 (u32) %d bytes - %d', indent, len(buf), ret[0])
+    return ret
 
 def decode_packet(buf, indent=""):
     cmd, _1, _2, length, _3 = struct.unpack(">IBBHI", buf[:12])
@@ -177,7 +182,7 @@ def encode_0ce5(s):
 def encode_0ce7(s, prefix):
     s += '\0'
     return encode_packet(0x0ce7, 1, struct.pack(">I" + str(len(s)) + "sx",
-                                prefix, s))
+                                prefix, str(s)))
 
 # 0cf0 - encapsulation
 def encode_0cf0(buf):
@@ -197,8 +202,8 @@ class x509cert(object):
     @staticmethod
     def decode_names(data):
         ret = dict()
-        for name_part in data:
-            for attr in name_part:
+        for i in range(0, len(data)):
+            for attr in data[i]:
                 type = str(attr.getComponentByPosition(0).getComponentByName('type'))
                 value = str(attr.getComponentByPosition(0).getComponentByName('value'))
                 value = str(pyasn1.codec.der.decoder.decode(value)[0])
@@ -271,6 +276,9 @@ class tncc(object):
 
         self.deviceid = device_id
 
+        self.setup_mechanize()
+	
+    def setup_mechanize(self):
         self.br = mechanize.Browser()
 
         self.cj = cookielib.LWPCookieJar()
@@ -375,56 +383,58 @@ class tncc(object):
         # We don't know if the xml parser on the other end is fully complaint,
         # just format a string like it expects.
 
-        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s'> " % self.platform
+        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s' ClientType='Agentless'> " % self.platform
         msg += "<ClientAttributes SequenceID='-1'> "
 
         def add_attr(key, val):
-            return "<Attribute Name='%s' Value='%s' />" % (val, key)
+            return "<Attribute Name='%s' Value='%s' />" % (key, val)
 
         msg += add_attr('Platform', self.platform)
         if self.hostname:
-            msg += add_attr('NETBIOSName', self.hostname)
+            msg += add_attr(self.hostname, 'NETBIOSName') # Reversed
 
         for mac in self.mac_addrs:
-            msg += add_attr('MACAddress', mac)
+            msg += add_attr(mac, 'MACAddress') # Reversed
 
         msg += "</ClientAttributes>  </FunkMessage>"
 
         return encode_0ce7(msg, MSG_FUNK_PLATFORM)
 
     def gen_funk_present(self):
-        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s'> " % self.platform
+        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s' ClientType='Agentless'> " % self.platform
         msg += "<Present SequenceID='0'></Present>  </FunkMessage>"
         return encode_0ce7(msg, MSG_FUNK)
 
     def gen_funk_response(self, certs):
 
-        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s'> " % self.platform
+        msg = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='%s' ClientType='Agentless'> " % self.platform
         msg += "<ClientAttributes SequenceID='0'> "
         msg += "<Attribute Name='Platform' Value='%s' />" % self.platform
         for name, value in certs.iteritems():
-            msg += "<Attribute Name='%s' Value='%s' />" % (name, value.data)
+            msg += "<Attribute Name='%s' Value='%s' />" % (name, value.data.strip())
+            msg += "<Attribute Name='%s' Value='%s' />" % (name, value.data.strip())
         msg += "</ClientAttributes>  </FunkMessage>"
 
         return encode_0ce7(msg, MSG_FUNK)
 
     def gen_policy_request(self):
-        policy_blocks = {
+        policy_blocks = collections.OrderedDict({
             'policy_request': {
-                'message_version': '2'
+                'message_version': '3'
             },
             'esap': {
                 'esap_version': 'NOT_AVAILABLE',
                 'fileinfo': 'NOT_AVAILABLE',
                 'has_file_versions': 'YES',
-                'needs_exact_sdk': 'YES'
+                'needs_exact_sdk': 'YES',
+                'opswat_sdk_version': '3'
             },
             'system_info': {
-                'os_version': '2.6.1',
-                'sp_version': '1',
+                'os_version': '2.6.2',
+                'sp_version': '0',
                 'hc_mode': 'userMode'
             }
-        }
+        })
 
         msg = ''
         for policy_key, policy_val in policy_blocks.iteritems():
@@ -469,13 +479,15 @@ class tncc(object):
             except:
                 self.set_cookie('DSSIGNIN', dssignin)
 
-        inner = encode_0ce7('policy request', MSG_POLICY)
-        inner += self.gen_policy_request()
+        inner = self.gen_policy_request()
+        inner += encode_0ce7('policy request\x00v4', MSG_POLICY)
         if self.funk:
             inner += self.gen_funk_platform()
             inner += self.gen_funk_present()
 
-        msg_raw = encode_0013(encode_0ce4(inner) + encode_0ce5('Accept-Language: en'))
+        msg_raw = encode_0013(encode_0ce4(inner) + encode_0ce5('Accept-Language: en') + encode_0cf3(1))
+        logging.debug('Sending packet -')
+        decode_packet(msg_raw)
 
         post_attrs = {
             'connID': '0',
@@ -493,6 +505,7 @@ class tncc(object):
         response = self.parse_response()
 
         # msg has the stuff we want, it's base64 encoded
+        logging.debug('Receiving packet -')
         msg_raw = base64.b64decode(response['msg'])
         _1, _2, msg_decoded = decode_packet(msg_raw)
 
@@ -540,11 +553,14 @@ class tncc(object):
             if cert_id not in certs:
                 logging.warn('Could not find certificate for %s', str(req_dns))
 
-        inner = self.gen_policy_response(policy_objs)
+        inner = ''
         if certs:
             inner += self.gen_funk_response(certs)
+        inner += self.gen_policy_response(policy_objs)
 
         msg_raw = encode_0013(encode_0ce4(inner) + encode_0ce5('Accept-Language: en'))
+        logging.debug('Sending packet -')
+        decode_packet(msg_raw)
 
         post_attrs = {
             'connID': '1',
@@ -555,6 +571,18 @@ class tncc(object):
         post_data = ''.join([ '%s=%s;' % (k, v) for k, v in post_attrs.iteritems()])
         self.r = self.br.open('https://' + self.vpn_host + self.path + 'hc/tnchcupdate.cgi', post_data)
 
+        # set the inital host checker cookie to the first DSPREAUTH cookie
+        self.set_cookie('DSPREAUTH_HC', self.find_cookie('DSPREAUTH').value)
+
+        # parse the response to retrieve the periodic host checking interval
+        response = self.parse_response()
+
+        # try to get the interval from the response, if not fallback with except
+        try:
+            self.hc_interval = int(response['msg'].split("interval=")[1].split("SESSION")[0])
+        except:
+            self.hc_interval = 10
+	
         # We have a new DSPREAUTH cookie
         return self.find_cookie('DSPREAUTH')
 
@@ -562,6 +590,15 @@ class tncc_server(object):
     def __init__(self, s, t):
         self.sock = s
         self.tncc = t
+	self.hc_scheduler = sched.scheduler(time.time, time.sleep)
+
+
+    def do_hc(self, sc):
+        hc_cookie=self.tncc.find_cookie('DSPREAUTH_HC').value
+        self.tncc.setup_mechanize()
+	self.tncc.get_cookie(hc_cookie, 'url_default').value
+        logging.info("==== Next Host Checker scheduled...")
+	sc.enter((60*(self.tncc.hc_interval-1)), 1, self.do_hc, (sc,))
 
     def process_cmd(self):
         buf = sock.recv(1024).decode('ascii')
@@ -580,8 +617,10 @@ class tncc_server(object):
             resp = '200\n3\n%s\n\n' % cookie.value
             sock.send(resp.encode('ascii'))
         elif cmd == 'setcookie':
-            # FIXME: Support for periodic updates
-            dsid_value = args['Cookie']
+            self.tncc.set_cookie('DSPREAUTH_HC', args['Cookie'])
+            self.hc_scheduler.enter((60*(self.tncc.hc_interval)-1)), 1, self.do_hc, (self.hc_scheduler,))
+            self.hc_scheduler.run()
+            logging.info("==== Received DSPREAUTH Cookie, going into a timed Host Checker loop...")
 
 if __name__ == "__main__":
     vpn_host = sys.argv[1]
@@ -624,10 +663,9 @@ if __name__ == "__main__":
         dspreauth_value = sys.argv[2]
         dssignin_value = sys.argv[3]
         'TNCC ', dspreauth_value, dssignin_value
-        print t.get_cookie(dspreauth, dssignin).value
+        print t.get_cookie(dspreauth_value, dssignin_value).value
     else:
         sock = socket.fromfd(0, socket.AF_UNIX, socket.SOCK_SEQPACKET)
         server = tncc_server(sock, t)
         while True:
             server.process_cmd()
-
